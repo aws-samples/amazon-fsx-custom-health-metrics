@@ -1,0 +1,168 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Deploy Custom FSx Availability Metrics Lambda
+
+Resources:
+  FSxAvailabilityPoller:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: 
+        ZipFile: | 
+          import boto3
+          import datetime
+
+          fsxclient=boto3.client('fsx')
+          cwclient=boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+
+            filesystem_response=fsxclient.describe_file_systems()
+
+            if 'NextToken' in filesystem_response:
+                response=fsxclient.describe_file_systems(NextToken=filesystem_response['NextToken'])
+                filesystems.extend(response['FileSystems'])
+            else:
+                filesystems=filesystem_response['FileSystems']
+
+            print("Checking currently deployed filesystems...")
+            print("Found "+ str(len(filesystems)) +":" )
+
+
+            for filesystem in filesystems:
+                print(filesystem['FileSystemId'],filesystem['Lifecycle'])
+                print("Writing results to CloudWatch...")
+                if filesystem['Lifecycle'] != "AVAILABLE":
+                    cwclient.put_metric_data(
+                    Namespace='FSXCustom',
+                    MetricData=[
+                        {
+                            'MetricName': "FileSystemAvailable",
+                            'Dimensions': [
+                                {
+                                    'Name': 'FileSystem',
+                                    'Value': filesystem['FileSystemId']
+                                },
+                            ],
+                            'Value': 0,
+                            'Unit': 'None',
+                            'StorageResolution': 60
+                        },
+                    ]
+                    )
+                else:
+                    cwclient.put_metric_data(
+                    Namespace='FSXCustom',
+                    MetricData=[
+                        {
+                            'MetricName': "FileSystemAvailable",
+                            'Dimensions': [
+                                {
+                                    'Name': 'FileSystem',
+                                    'Value': filesystem['FileSystemId']
+                                },
+                            ],
+                            'Value': 1,
+                            'Unit': 'None',
+                            'StorageResolution': 60
+                        },
+                    ]
+                    )
+      Handler: index.lambda_handler
+      MemorySize: 128
+      PackageType: Zip
+      Timeout: 299
+      Runtime: python3.8
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      FunctionName: FSx-Availability-Poller
+      ReservedConcurrentExecutions: 1
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: "lambda:InvokeFunction"
+      FunctionName: FSx-Availability-Poller
+      Principal: "events.amazonaws.com"      
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/FSx-5m-Poller
+    DependsOn: 
+     - FSxAvailabilityPoller
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+              - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+  EventBridge5mPoll:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 5m Poller for Custom FSx Metric
+      Name: FSx-5m-Poller
+      ScheduleExpression: rate(5 minute)
+      State: ENABLED
+      Targets: 
+       - 
+         Arn: !GetAtt FSxAvailabilityPoller.Arn
+         Id: "FSxAvailabilityPollerLatest"
+  FSxDescribeFileSystemPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: "Fsx-describe-file-system-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+         - Effect: "Allow"
+           Action: 
+            - "fsx:DescribeFileSystems"
+           Resource:
+              - !Sub >-
+                arn:${AWS::Partition}:fsx:${AWS::Region}:${AWS::AccountId}:file-system/*
+      Roles:
+        - Ref: "LambdaExecutionRole"
+  CloudWatchMetricLogsLambdaAccess:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: "CloudWatchMetricLogsLambdaAccess"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+         - Effect: "Allow"
+           Action: 
+              - 'cloudwatch:PutMetricData'
+           Resource: "*"
+           Condition:
+             StringEquals:
+               "cloudwatch:namespace": "FSXCustom"
+         - Effect: "Allow"
+           Action: 
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+           Resource:
+              - !Sub >-
+                arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/FSx-Availability-Poller-*
+              - !Sub >-
+                arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/FSx-Availability-Poller*:log-stream:*
+      Roles:
+        - Ref: "LambdaExecutionRole"
